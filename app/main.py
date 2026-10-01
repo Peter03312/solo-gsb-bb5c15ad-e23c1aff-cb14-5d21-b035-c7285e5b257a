@@ -7,7 +7,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Header, Path, Request, Response
+from fastapi import FastAPI, Header, Path, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from psycopg.errors import CheckViolation
@@ -30,6 +30,9 @@ from .repository import (
 from .schemas import (
     CommitmentIssueRequest,
     CommitmentOut,
+    ObservationEventPage,
+    ObservationOut,
+    ObservationRegisterRequest,
     PassIssueRequest,
     PassOut,
     RegionBatchRequest,
@@ -59,8 +62,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.5.0",
-    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；区域写操作（登记/修订/删除/批量）支持 Idempotency-Key 幂等重试。",
+    version="1.6.0",
+    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；可为带时区绝对时刻轨迹登记可取消的安全状态观察（安全或不安全均可登记），区域变更成功提交时为未取消且未结束观察的安全结论翻转在同一事务追加事件；区域写操作（登记/修订/删除/批量）支持 Idempotency-Key 幂等重试。",
     lifespan=lifespan,
 )
 
@@ -172,6 +175,26 @@ def _pass_row_to_out(row: dict) -> dict:
             for p in row["trajectory"]
         ],
         "issued_at": row["created_at"],
+        "cancelled_at": row["cancelled_at"],
+    }
+
+
+def _observation_row_to_out(row: dict) -> dict:
+    """把 observations 表行（trajectory 为 JSONB，t 为 epoch 秒）转成 API 输出。"""
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "trajectory": [
+            {
+                "x": p["x"],
+                "y": p["y"],
+                "t": datetime.fromtimestamp(p["t"], tz=timezone.utc),
+            }
+            for p in row["trajectory"]
+        ],
+        "conclusion": row["conclusion"],
+        "revision": row["conclusion_revision"],
+        "registered_at": row["created_at"],
         "cancelled_at": row["cancelled_at"],
     }
 
@@ -900,6 +923,147 @@ def cancel_commitment(commitment_id: int = Path(ge=1)):
     return _commitment_row_to_out(row, [])
 
 
+# ---------------------------------------------------------------- 安全状态观察
+
+OBSERVATION_EVENT_PAGE_MAX = 500
+
+
+@app.post("/api/observations", response_model=ObservationOut, status_code=201,
+          responses={
+              422: {"description": "轨迹非法（点数不足/时刻不严格递增/首点不晚于登记时刻）"},
+          },
+          tags=["observations"])
+def register_observation(payload: ObservationRegisterRequest):
+    """为带时区绝对时刻轨迹登记可取消的安全状态观察。
+
+    轨迹要求与 `/api/verify` 相同（至少 2 点、带时区绝对时刻、时刻严格
+    递增、相邻点直线匀速），且**首点时刻必须晚于登记时刻**（以服务端拿到
+    写锁后的当前时间为准，已开始的轨迹拒绝）。登记在持有全局元数据行锁的
+    写事务内完成，按**当前完整区域集合**核验，沿用边界接触即穿越、生效期
+    左闭右开规则：
+
+    * 安全与不安全均可登记并返回 **201**，响应含观察 `id`、`status`、
+      当前安全结论 `conclusion`（`safe`/`unsafe`）、该结论对应的区域
+      `revision`、回显轨迹与 `registered_at`；登记不推进区域 revision，
+      也不产生事件；
+    * 轨迹非法或首点不晚于当前时刻：**422** `invalid_trajectory`/
+      `validation_error`，不落库。
+
+    区域变更（登记/修订/删除/批量）成功提交时，未取消且末点时刻未过的
+    观察若安全结论翻转，会在**同一事务**内追加翻转事件（见
+    `GET /api/observations/{id}/events`）；观察不阻止任何区域变更。
+    """
+    # 时刻严格递增等结构校验在几何层统一报错；先快速失败避免无谓的数据库读取
+    traj = geometry.validate_trajectory(payload.points, lambda p: p.t)
+
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            try:
+                row = repository.register_observation(cur, traj)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+    return _observation_row_to_out(row)
+
+
+@app.get("/api/observations/{observation_id}", response_model=ObservationOut,
+         tags=["observations"])
+def get_observation(observation_id: int = Path(ge=1)):
+    """按 ID 查询观察：返回轨迹、状态、最近安全结论及结论对应 revision；
+    未知 ID 返回 404。"""
+    with db.pool.connection() as conn:
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            row = repository.get_observation(cur, observation_id)
+    if row is None:
+        raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
+                                                               "message": f"观察 {observation_id} 不存在"}})
+    return _observation_row_to_out(row)
+
+
+@app.post("/api/observations/{observation_id}/cancel", response_model=ObservationOut,
+          tags=["observations"])
+def cancel_observation(observation_id: int = Path(ge=1)):
+    """取消观察并返回状态；重复取消幂等（结果不变），未知 ID 返回 404。
+
+    取消与登记、所有区域写入在同一把全局元数据行锁上串行化；取消不推进
+    区域 revision。已取消的观察不再对任何区域变更产生事件。
+    """
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            try:
+                row = repository.cancel_observation(cur, observation_id)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                if row is None:
+                    conn.rollback()
+                else:
+                    conn.commit()
+    if row is None:
+        raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
+                                                               "message": f"观察 {observation_id} 不存在"}})
+    return _observation_row_to_out(row)
+
+
+@app.get("/api/observations/{observation_id}/events",
+         response_model=ObservationEventPage, tags=["observations"])
+def get_observation_events(
+    observation_id: int = Path(ge=1),
+    cursor: int = Query(
+        default=0, ge=0,
+        description="事件序号游标：只返回 seq 严格大于该游标的事件；首页传 0 或不传",
+    ),
+    limit: int = Query(
+        default=100, ge=1, le=OBSERVATION_EVENT_PAGE_MAX,
+        description="每页事件数（1~500，默认 100）",
+    ),
+):
+    """按观察编号与事件序号游标**升序分页**读取结论翻转事件。
+
+    事件按 `seq`（观察内从 1 开始严格递增）升序返回；响应 `next_cursor`
+    为下一页游标（即本页最后一条事件的 `seq`），无更多事件时为 `null`。
+    下一页请求携带 `?cursor=<next_cursor>` 即可。观察编号未知返回 404
+    （观察从未产生事件的已存在观察返回空页而非 404）。
+    """
+    with db.pool.connection() as conn:
+        conn.rollback()
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            row = repository.get_observation(cur, observation_id)
+            if row is None:
+                view = None
+            else:
+                events, has_more = repository.list_observation_events(
+                    cur, observation_id, cursor, limit
+                )
+                view = {
+                    "observation_id": observation_id,
+                    "events": [
+                        {
+                            "seq": e["seq"],
+                            "old_conclusion": e["old_conclusion"],
+                            "new_conclusion": e["new_conclusion"],
+                            "revision": e["revision"],
+                            "occurred_at": e["created_at"],
+                        }
+                        for e in events
+                    ],
+                    "next_cursor": events[-1]["seq"] if has_more and events else None,
+                }
+    if view is None:
+        raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
+                                                               "message": f"观察 {observation_id} 不存在"}})
+    return view
+
+
 # ---------------------------------------------------------------- 轨迹核验
 
 @app.post("/api/verify", response_model=VerifyResponse, tags=["verification"])
@@ -1024,6 +1188,9 @@ def root():
             "POST /api/passes/{id}/cancel",
             "POST /api/commitments", "GET /api/commitments/{id}",
             "POST /api/commitments/{id}/cancel",
+            "POST /api/observations", "GET /api/observations/{id}",
+            "POST /api/observations/{id}/cancel",
+            "GET /api/observations/{id}/events",
             "GET /health",
         ],
     }

@@ -91,6 +91,56 @@ CREATE TABLE IF NOT EXISTS commitments (
 CREATE INDEX IF NOT EXISTS idx_commitments_constraining
     ON commitments (status, window_end);
 
+-- 安全状态观察：安全员为一条带时区绝对时刻轨迹登记的可取消观察；
+-- 安全或不安全均可登记。登记时记录当前安全结论（safe/unsafe）与当时的
+-- 区域 revision。区域变更（登记/修订/删除/批量）成功提交时，对未取消且
+-- 末点时刻未过的观察比较变更前后结论，仅结论翻转才在同一事务追加事件，
+-- 整批变更对同一观察至多一条事件
+CREATE TABLE IF NOT EXISTS observations (
+    id              BIGSERIAL PRIMARY KEY,
+    -- 登记时的轨迹：[{"x": .., "y": .., "t": <epoch 秒>}, ...]
+    trajectory      JSONB NOT NULL,
+    start_time      TIMESTAMPTZ NOT NULL,
+    end_time        TIMESTAMPTZ NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active',
+    -- 登记时的区域集合 revision
+    registered_revision BIGINT NOT NULL,
+    -- 最近一次安全结论及其对应的区域 revision（随翻转事件在同一事务更新）
+    conclusion      TEXT NOT NULL,
+    conclusion_revision BIGINT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    cancelled_at    TIMESTAMPTZ,
+    CONSTRAINT observations_status_check CHECK (status IN ('active', 'cancelled')),
+    CONSTRAINT observations_time_order CHECK (start_time < end_time),
+    CONSTRAINT observations_conclusion_check
+        CHECK (conclusion IN ('safe', 'unsafe'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_observations_constraining
+    ON observations (status, end_time);
+
+-- 观察结论翻转事件：每条事件对应一次成功的区域变更（同一写事务写入）。
+-- seq 为观察内从 1 开始、严格递增的事件序号，用于按序号游标升序分页
+CREATE TABLE IF NOT EXISTS observation_events (
+    id              BIGSERIAL PRIMARY KEY,
+    observation_id  BIGINT NOT NULL REFERENCES observations (id),
+    seq             BIGINT NOT NULL,
+    old_conclusion  TEXT NOT NULL,
+    new_conclusion  TEXT NOT NULL,
+    -- 引起本次翻转的区域变更之后的新全局 revision
+    revision        BIGINT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT observation_events_conclusion_check
+        CHECK (old_conclusion IN ('safe', 'unsafe')
+               AND new_conclusion IN ('safe', 'unsafe')
+               AND old_conclusion <> new_conclusion),
+    CONSTRAINT observation_events_seq_check CHECK (seq >= 1),
+    CONSTRAINT observation_events_unique_seq UNIQUE (observation_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_observation_events_obs_seq
+    ON observation_events (observation_id, seq);
+
 -- 幂等键：区域写操作（登记/修订/删除/批量变更）的网络超时安全重试。
 -- 占位行与业务变更、响应回填在同一事务提交，因此已提交的行必然带有
 -- 完整的原 HTTP 状态码与响应体；业务失败回滚时占位行一并消失（不占键）

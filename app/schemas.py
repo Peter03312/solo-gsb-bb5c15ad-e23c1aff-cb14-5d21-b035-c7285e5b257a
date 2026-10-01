@@ -227,6 +227,18 @@ class PassIssueRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ObservationRegisterRequest(BaseModel):
+    """登记安全状态观察：一条带时区绝对时刻的连续轨迹（结构同 /api/verify）。
+
+    安全或不安全均可登记；轨迹至少 2 点、时刻严格递增，且首点时刻必须
+    晚于登记时刻（服务端拿到写锁后的当前时间）。
+    """
+
+    points: list[PointIn] = Field(min_length=2)
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class RelativePointIn(BaseModel):
     """调度请求中的轨迹点：相对首点的秒数（首点必须为 0）。"""
 
@@ -418,6 +430,46 @@ class PassOut(_UTCDatetimeModel):
     trajectory: list[PassPointOut]
     issued_at: datetime
     cancelled_at: datetime | None
+
+
+class ObservationOut(_UTCDatetimeModel):
+    """安全状态观察：登记/查询/取消的统一响应。
+
+    status: active（未取消）/ cancelled（已取消）；
+    conclusion 为最近一次安全结论（safe/unsafe），conclusion_revision 为
+    该结论对应的区域集合版本号（登记时即为当时 revision）；
+    registered_at 为登记时刻。
+    """
+
+    id: int
+    status: str
+    trajectory: list[PassPointOut]
+    conclusion: str
+    revision: int
+    registered_at: datetime
+    cancelled_at: datetime | None
+
+
+class ObservationEventOut(_UTCDatetimeModel):
+    """观察结论翻转事件：一次成功区域变更导致 safe↔unsafe 翻转的记录。
+
+    seq 为观察内从 1 开始严格递增的事件序号；revision 为引起翻转的区域
+    变更之后的新全局 revision。
+    """
+
+    seq: int
+    old_conclusion: str
+    new_conclusion: str
+    revision: int
+    occurred_at: datetime
+
+
+class ObservationEventPage(_UTCDatetimeModel):
+    """观察事件分页结果：按 seq 升序；next_cursor 为下一页游标（末页为 null）。"""
+
+    observation_id: int
+    events: list[ObservationEventOut]
+    next_cursor: int | None
 
 
 class ErrorOut(BaseModel):

@@ -231,6 +231,57 @@ def main() -> None:
     call("DELETE", f"/api/regions/{commit_region['region']['id']}")
     call("DELETE", f"/api/regions/{unblocked['region']['id']}")
 
+    # ---- 安全状态观察：登记 / 查询 / 取消 + 结论翻转事件分页 ----
+    wide = {"valid_from": "2020-01-01T00:00:00Z", "valid_to": "2030-01-01T00:00:00Z"}
+    # 观察 1：从区域上方 y=200 经过；此刻演示区域均已清理，结论 safe
+    obs_safe = call("POST", "/api/observations", {"points": [
+        {"x": -50, "y": 200, "t": t1},
+        {"x": 350, "y": 200, "t": t2},
+    ]})
+    show("登记观察（上方安全轨迹，安全/不安全均可登记）", obs_safe)
+    obs1_id = obs_safe["id"]
+
+    obs_region = call("POST", "/api/regions", {
+        "name": "观察演示-A区",
+        "polygon": [[0, 0], [100, 0], [100, 100], [0, 100]],
+        **wide,
+    })
+    obs_region_id = obs_region["region"]["id"]
+
+    # 观察 2：直穿 A 区的轨迹——不安全同样可以登记（登记不阻止任何变更）
+    obs_unsafe = call("POST", "/api/observations", {"points": [
+        {"x": -50, "y": 50, "t": t1},
+        {"x": 350, "y": 50, "t": t2},
+    ]})
+    show("登记观察（直穿区域，结论 unsafe 同样登记）", obs_unsafe)
+    obs2_id = obs_unsafe["id"]
+
+    # 扩大 A 区到覆盖 y=200：观察 1 safe→unsafe（一条事件）；观察 2 结论不变
+    call("PATCH", f"/api/regions/{obs_region_id}",
+         {"polygon": [[0, 0], [400, 0], [400, 300], [0, 300]]})
+    # 删除 A 区：两条观察都 unsafe→safe（各再追加一条事件）
+    call("DELETE", f"/api/regions/{obs_region_id}")
+
+    show("按编号查询观察（轨迹/状态/最近结论/revision）",
+         call("GET", f"/api/observations/{obs1_id}"))
+
+    # 事件按观察内序号游标升序分页：limit=1 翻页直到 next_cursor 为 None
+    print("\n== 观察 1 的翻转事件（游标分页，每页 1 条） ==")
+    cursor = 0
+    while True:
+        page = call("GET", f"/api/observations/{obs1_id}/events?limit=1&cursor={cursor}")
+        for e in page["events"]:
+            print(f"  seq={e['seq']} {e['old_conclusion']}→{e['new_conclusion']}"
+                  f" @revision={e['revision']}")
+        if page["next_cursor"] is None:
+            break
+        cursor = page["next_cursor"]
+
+    # 取消（幂等，重复取消结果不变）；取消后不再产生事件
+    show("取消观察 1", call("POST", f"/api/observations/{obs1_id}/cancel"))
+    show("重复取消（结果不变）", call("POST", f"/api/observations/{obs1_id}/cancel"))
+    show("取消观察 2", call("POST", f"/api/observations/{obs2_id}/cancel"))
+
 
 if __name__ == "__main__":
     main()

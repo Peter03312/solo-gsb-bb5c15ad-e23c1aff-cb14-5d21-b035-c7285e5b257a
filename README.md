@@ -12,7 +12,12 @@
 安全员还可以为**相对秒数固定行程**与**带时区候选出发窗口申请择时通行
 承诺**：签发时给出当前左闭右开的安全出发区间；未取消且窗口未结束的承诺
 会约束后续一切区域变更——变更前窗口内仍有未来安全时刻、变更后一点不剩的
-登记/修订/删除/批量变更都会被整体拒绝（409）。
+登记/修订/删除/批量变更都会被整体拒绝（409）。安全员还可为**带时区绝对
+时刻轨迹登记可取消的安全状态观察**：安全或不安全均可登记，登记返回观察
+编号、当前安全结论与区域 revision；单区及批量区域变更成功时，对未取消且
+末点未过的观察比较变更前后安全结论，**仅结论翻转**才在**同一事务**留一条
+含观察编号、旧/新结论与新 revision 的事件（整批至多一条/观察）；观察
+**不阻止**区域变更，也不改变通行凭证与择时承诺的保护。
 
 ## 核验规则
 
@@ -149,8 +154,74 @@
   全局元数据行锁，完全串行化——不存在"区间算好到落库之间被并发变更
   插队"的漏检窗口。
 
+## 安全状态观察规则（登记 / 查询 / 取消 / 事件）
+
+安全员可以为一条**带时区绝对时刻轨迹**登记**可取消的安全状态观察**：
+系统按登记时的完整区域集合给出当前安全结论；此后每次成功的区域变更都会
+在同一写事务内复核未结束观察的结论是否翻转，并留下可分页读取的事件流。
+观察是**纯通知**：不阻止任何区域变更，也不改变通行凭证与择时承诺的保护。
+
+* **登记 `POST /api/observations`**：请求体与 `/api/verify` 相同
+  （`points` 至少 2 点、带时区绝对时刻、时刻严格递增、相邻点直线匀速），
+  且**首点时刻必须晚于登记时刻**（以服务端拿到写锁后的当前时间为准）。
+  登记在持有全局元数据行锁的写事务内完成，按**当前完整区域集合**核验，
+  沿用直线匀速、**边界接触即穿越**、生效期**左闭右开**规则：
+  * **安全与不安全均可登记**，均返回 **201**，响应含观察 `id`、`status`
+    （`active`）、当前结论 `conclusion`（`safe`/`unsafe`）、该结论对应
+    的区域 `revision`、回显轨迹与 `registered_at`；
+  * 登记**不推进**区域 revision，也不产生事件；
+  * 轨迹非法（点数不足/坐标非有限/时刻不严格递增/不带时区）或首点不晚于
+    当前时刻：**422** `invalid_trajectory` / `validation_error`，不落库。
+* **查询 `GET /api/observations/{id}`**：返回观察的轨迹、状态
+  （`active`/`cancelled`）、**最近结论** `conclusion` 及该结论对应的
+  `revision`；未知编号返回 **404** `not_found`。
+* **取消 `POST /api/observations/{id}/cancel`**：置为 `cancelled` 并
+  返回观察状态；**重复取消幂等**（结果不变，仍为 200）；未知编号 **404**。
+  取消不推进区域 revision。
+* **区域变更产生翻转事件**：单区登记/修订/删除与**批量变更成功提交时**，
+  系统在**同一写事务**内对每张**未取消且末点时刻未过**（末点晚于当前
+  时刻）的观察，分别用**变更前**与**变更后**的完整区域集合重新核验：
+  * **仅结论翻转**（`safe→unsafe` 或 `unsafe→safe`）才追加一条事件，
+    事件含观察编号、观察内事件序号 `seq`（从 1 开始连续递增）、
+    **旧结论**、**新结论**与变更后的**新 revision**；同时更新观察的
+    最近结论与对应 revision；
+  * 结论不变（仍安全或仍不安全）**不产生事件**；批量变更比较的是
+    **整批变更前 vs 整批变更后**的净效果，**整批对同一观察至多一条**
+    事件，与批内操作数量无关；
+  * **已取消或末点时刻已过**的观察不再核验、不再产生事件；
+  * 核验完全沿用直线匀速、边界接触即穿越、生效期左闭右开规则；
+  * **观察不阻止区域变更**：不存在观察专属的 409；凭证 `pass_conflict`
+    与承诺 `commitment_conflict` 的保护不受观察影响；
+  * 区域变更失败回滚（422/404/409）时事件与结论更新一并回滚；携带
+    `Idempotency-Key` 的变更重试只回放首次响应，**不会重复产生事件**。
+* **事件分页 `GET /api/observations/{id}/events`**：按观察编号与
+  **事件序号游标升序**读取，查询参数：
+  * `cursor`：事件序号游标，只返回 `seq` 严格大于游标的事件；首页传 `0`
+    或不传（默认 0，不可为负）；
+  * `limit`：每页事件数，1~500，默认 100；
+  * 响应含 `observation_id`、`events`（按 `seq` 升序，每条含
+    `seq/old_conclusion/new_conclusion/revision/occurred_at`）与
+    `next_cursor`（下一页游标，即本页最后一条事件的 `seq`；没有更多
+    事件时为 `null`）；观察存在但从未翻转时返回空页（`events: []`、
+    `next_cursor: null`），观察编号未知返回 **404**。
+* **串行化**：观察登记、取消与所有区域写入（含批量）、凭证/承诺签发共用
+  同一把全局元数据行锁，完全串行化——不存在"结论算好到落库之间被并发
+  变更插队"的漏检窗口。
+
 ```bash
-# 签发：固定行程 + 未来候选窗口，返回当前安全出发区间
+# 登记观察：安全或不安全均可，返回编号、当前结论与 revision
+curl -X POST http://localhost:8000/api/observations \
+  -H 'Content-Type: application/json' \
+  -d '{"points":[{"x":-50,"y":50,"t":"2026-10-02T12:00:00Z"},
+                 {"x":350,"y":50,"t":"2026-10-02T12:05:00Z"}]}'
+# 查询观察（轨迹/状态/最近结论/revision）与事件（游标升序分页）
+curl http://localhost:8000/api/observations/1
+curl 'http://localhost:8000/api/observations/1/events?limit=100&cursor=0'
+# 取消（幂等）
+curl -X POST http://localhost:8000/api/observations/1/cancel
+```
+
+
 curl -X POST http://localhost:8000/api/commitments \
   -H 'Content-Type: application/json' \
   -d '{"points":[{"x":-50,"y":50,"t":0},{"x":150,"y":50,"t":60}],
@@ -251,7 +322,8 @@ docker compose up --build
 | PostgreSQL | localhost:5432（用户/库/密码均为 restrict） |
 
 首次启动时应用会自动建表（`regions`、`region_meta`、`passes`、
-`commitments`、`idempotency_keys`）并初始化全局版本号，无需手工执行 SQL。数据库未就绪时应用会自动重试连接
+`commitments`、`observations`、`observation_events`、
+`idempotency_keys`）并初始化全局版本号，无需手工执行 SQL。数据库未就绪时应用会自动重试连接
 （默认 30 次、间隔 1 秒）。
 
 停止并清理数据卷：
@@ -305,6 +377,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/commitments` | 为相对秒数固定行程+候选窗口签发择时通行承诺（201） |
 | GET | `/api/commitments/{id}` | 按 ID 查询承诺与当前可用安全出发区间 |
 | POST | `/api/commitments/{id}/cancel` | 取消承诺（幂等），返回状态 |
+| POST | `/api/observations` | 为带时区绝对时刻轨迹登记安全状态观察（201；安全/不安全均可） |
+| GET | `/api/observations/{id}` | 按 ID 查询观察（轨迹/状态/最近结论/revision） |
+| POST | `/api/observations/{id}/cancel` | 取消观察（幂等），返回状态 |
+| GET | `/api/observations/{id}/events` | 按事件序号游标升序分页读取结论翻转事件 |
 
 登记示例：
 
@@ -627,6 +703,87 @@ curl -X POST http://localhost:8000/api/commitments/1/cancel  # 取消，幂等
 }
 ```
 
+### 安全状态观察 `POST /api/observations`
+
+为带时区绝对时刻轨迹登记可取消的安全状态观察。请求体与 `/api/verify`
+相同，但首点时刻必须晚于登记时刻（已开始的轨迹拒绝）；**安全或不安全
+均可登记**：
+
+```json
+{
+  "points": [
+    {"x": -50, "y": 200, "t": "2026-10-02T12:00:00Z"},
+    {"x": 350, "y": 200, "t": "2026-10-02T12:05:00Z"}
+  ]
+}
+```
+
+返回 **201**（`revision` 为登记时结论对应的区域集合版本；登记不推进
+revision）：
+
+```json
+{
+  "id": 1,
+  "status": "active",
+  "trajectory": [
+    {"x": -50.0, "y": 200.0, "t": "2026-10-02T12:00:00Z"},
+    {"x": 350.0, "y": 200.0, "t": "2026-10-02T12:05:00Z"}
+  ],
+  "conclusion": "safe",
+  "revision": 3,
+  "registered_at": "2026-10-01T11:55:00Z",
+  "cancelled_at": null
+}
+```
+
+轨迹直穿区域时同样返回 **201**，只是 `conclusion` 为 `"unsafe"`；
+轨迹非法或首点不晚于当前时刻返回 **422** `invalid_trajectory`，不落库。
+
+查询与取消（未知编号 404，重复取消幂等）：
+
+```bash
+curl http://localhost:8000/api/observations/1
+curl -X POST http://localhost:8000/api/observations/1/cancel
+```
+
+区域变更成功后，观察的最近结论 `conclusion` 与对应 `revision` 会随翻转
+事件更新（见下）；已取消或末点时刻已过的观察不再更新。
+
+### 观察事件分页 `GET /api/observations/{id}/events`
+
+单区登记/修订/删除与批量变更**成功提交**时，未取消且末点时刻未过的观察
+若变更前后安全结论翻转，会在**同一事务**追加一条事件。按观察编号与事件
+序号游标**升序分页**读取（`cursor` 默认 0、只取 `seq > cursor`；
+`limit` 默认 100、范围 1~500；`next_cursor` 为下一页游标，末页为
+`null`）：
+
+```bash
+curl 'http://localhost:8000/api/observations/1/events?limit=100&cursor=0'
+```
+
+```json
+{
+  "observation_id": 1,
+  "events": [
+    {
+      "seq": 1,
+      "old_conclusion": "safe",
+      "new_conclusion": "unsafe",
+      "revision": 4,
+      "occurred_at": "2026-10-01T12:00:00Z"
+    }
+  ],
+  "next_cursor": 1
+}
+```
+
+* 批量变更比较整批变更前后的净效果，**整批对同一观察至多一条事件**；
+  结论不变不产生事件；区域变更失败回滚或幂等重试回放不会重复产生事件。
+* 观察存在但从未翻转时返回空页（非 404）；观察编号未知返回 **404**
+  `not_found`；`cursor<0`、`limit` 越界返回 **422**。
+* 观察不阻止区域变更（没有观察专属冲突），也不影响 `pass_conflict` /
+  `commitment_conflict` 的既有保护。
+
 ### 出发时刻调度 `POST /api/schedule`
 
 请求：固定行程用相对首点的秒数（首点 `t=0`、严格递增），候选时段带时区：
@@ -690,6 +847,8 @@ revision 冲突、区域变更与未取消凭证冲突、幂等键冲突）。�
 `not_found`（404，未知凭证 ID）；
 择时承诺另用 `commitment_conflict`（409，区域变更抹掉未结束承诺窗口内的
 全部安全出发时刻）与 `not_found`（404，未知承诺 ID）；
+安全状态观察另用 `not_found`（404，未知观察编号；观察登记复用
+`invalid_trajectory`）；
 幂等键相关另用 `invalid_idempotency_key`（422，键为空或超过 128 字符）与
 `idempotency_key_conflict`（409，同键被内容不同的请求复用）：
 
@@ -720,6 +879,10 @@ bash examples/curl_passes.sh
 # 择时通行承诺（签发/查询当前区间/取消；含 409 commitment_conflict 约束、
 # 幂等取消、无安全时刻与窗口起点已过拒签）
 bash examples/curl_commitments.sh
+
+# 安全状态观察（登记/查询/取消；安全与不安全均可登记；区域变更后的
+# 结论翻转事件、事件游标分页、取消幂等与错误契约）
+bash examples/curl_observations.sh
 
 # 幂等重试（Idempotency-Key：同键重试回放原响应、同键不同内容 409、
 # 非法键 422、失败不占键、带键删除/批量重试）
@@ -758,18 +921,23 @@ DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_
 # 幂等键 API 集成测试（同键重试回放原响应、并发同键只提交一次、
 # 同键不同内容 409、非法键 422、失败不占键，会清空 regions/passes/idempotency_keys 表）
 DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_idempotency_api.py
+
+# 安全状态观察 API 集成测试（安全/不安全均可登记、单区与批量翻转事件、
+# 整批至多一条/观察、失败回滚与幂等回放不重复产生事件、取消与过期不产生
+# 事件、事件游标分页、观察不影响凭证/承诺保护，会清空全部业务表）
+DATABASE_URL="postgresql://restrict@localhost:5432/restrict" python3 tests/test_observations_api.py
 ```
 
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 路由、事务边界、错误处理（verify、schedule、batch、passes、commitments、幂等键）
-  schemas.py     # Pydantic 请求/响应模型与输入校验（含批量操作判别联合）
+  main.py        # FastAPI 路由、事务边界、错误处理（verify、schedule、batch、passes、commitments、observations、幂等键）
+  schemas.py     # Pydantic 请求/响应模型与输入校验（含批量操作判别联合、观察与事件分页模型）
   geometry.py    # 穿越核验与安全出发区间引擎（插值、裁剪、合并、区间差）
-  repository.py  # 区域 CRUD、一致性快照读取、批量原子变更事务、通行凭证/择时承诺签发与取消、区域写入前的凭证与承诺保护、幂等键占位/回放
-  db.py          # psycopg3 连接池、建表初始化（regions/region_meta/passes/commitments/idempotency_keys）、启动重试
-examples/        # curl 与 Python 调用示例（含批量原子变更、通行凭证、择时承诺与幂等重试）
-tests/           # 几何离线测试与 API/批量变更/通行凭证/择时承诺/幂等键集成测试
+  repository.py  # 区域 CRUD、一致性快照读取、批量原子变更事务、通行凭证/择时承诺/安全状态观察签发与取消、区域写入前的凭证与承诺保护、写入成功后的观察结论翻转事件、幂等键占位/回放
+  db.py          # psycopg3 连接池、建表初始化（regions/region_meta/passes/commitments/observations/observation_events/idempotency_keys）、启动重试
+examples/        # curl 与 Python 调用示例（含批量原子变更、通行凭证、择时承诺、安全状态观察与幂等重试）
+tests/           # 几何离线测试与 API/批量变更/通行凭证/择时承诺/安全状态观察/幂等键集成测试
 Dockerfile, docker-compose.yml
 ```
