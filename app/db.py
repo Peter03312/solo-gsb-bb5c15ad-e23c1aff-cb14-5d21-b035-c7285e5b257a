@@ -91,6 +91,51 @@ CREATE TABLE IF NOT EXISTS commitments (
 CREATE INDEX IF NOT EXISTS idx_commitments_constraining
     ON commitments (status, window_end);
 
+-- 安全状态观察：安全员为带时区绝对时刻轨迹登记的可取消安全状态观察。
+-- 登记时按当前完整区域集合给出安全/不安全结论（两者均可登记）；
+-- 未取消且末点时刻未过的观察不约束任何区域变更，但每次单区/批量区域变更
+-- 成功时，系统在同一事务内比较变更前后的安全结论：仅结论翻转才为该观察
+-- 追加一条 observation_events 事件（含旧/新结论与新 revision）。
+-- last_safety/last_revision 为最近一次结论及其对应的区域集合版本
+CREATE TABLE IF NOT EXISTS observations (
+    id              BIGSERIAL PRIMARY KEY,
+    -- 登记时的轨迹：[{"x": .., "y": .., "t": <epoch 秒>}, ...]
+    trajectory      JSONB NOT NULL,
+    start_time      TIMESTAMPTZ NOT NULL,
+    end_time        TIMESTAMPTZ NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active',
+    last_safety     TEXT NOT NULL,
+    last_revision   BIGINT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    cancelled_at    TIMESTAMPTZ,
+    CONSTRAINT observations_status_check CHECK (status IN ('active', 'cancelled')),
+    CONSTRAINT observations_safety_check CHECK (last_safety IN ('safe', 'unsafe')),
+    CONSTRAINT observations_time_order CHECK (start_time < end_time)
+);
+
+CREATE INDEX IF NOT EXISTS idx_observations_constraining
+    ON observations (status, end_time);
+
+-- 观察事件：区域变更导致观察安全结论翻转时，在变更同一事务内追加一条。
+-- seq 为观察内单调递增的事件序号（游标分页用）；整批变更对每条观察至多一条
+CREATE TABLE IF NOT EXISTS observation_events (
+    id              BIGSERIAL PRIMARY KEY,
+    observation_id  BIGINT NOT NULL REFERENCES observations(id),
+    seq             BIGINT NOT NULL,
+    old_safety      TEXT NOT NULL,
+    new_safety      TEXT NOT NULL,
+    revision        BIGINT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT observation_events_safety_check
+        CHECK (old_safety IN ('safe', 'unsafe')
+               AND new_safety IN ('safe', 'unsafe')
+               AND old_safety <> new_safety),
+    CONSTRAINT observation_events_seq_unique UNIQUE (observation_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_observation_events_cursor
+    ON observation_events (observation_id, seq);
+
 -- 幂等键：区域写操作（登记/修订/删除/批量变更）的网络超时安全重试。
 -- 占位行与业务变更、响应回填在同一事务提交，因此已提交的行必然带有
 -- 完整的原 HTTP 状态码与响应体；业务失败回滚时占位行一并消失（不占键）

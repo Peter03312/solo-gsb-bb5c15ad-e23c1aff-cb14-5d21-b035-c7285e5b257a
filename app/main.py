@@ -7,7 +7,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Header, Path, Request, Response
+from fastapi import FastAPI, Header, Path, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from psycopg.errors import CheckViolation
@@ -30,6 +30,9 @@ from .repository import (
 from .schemas import (
     CommitmentIssueRequest,
     CommitmentOut,
+    ObservationEventsResponse,
+    ObservationIssueRequest,
+    ObservationOut,
     PassIssueRequest,
     PassOut,
     RegionBatchRequest,
@@ -59,8 +62,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="临时限行核验服务",
-    version="1.5.0",
-    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；区域写操作（登记/修订/删除/批量）支持 Idempotency-Key 幂等重试。",
+    version="1.6.0",
+    description="登记平面多边形限行区域、对连续轨迹进行穿越核验，并计算固定行程的安全出发区间；支持多区域变更与轨迹核验一次原子提交；可为指定轨迹签发可取消的通行凭证，未取消且未结束的凭证约束后续区域变更；安全员还可为相对秒数固定行程与候选出发窗口申请择时通行承诺，未取消且窗口未结束的承诺在区域变更抹除其全部未来安全出发时刻时整笔拒绝变更；安全员可登记可取消的安全状态观察（安全/不安全均可），单区与批量区域变更成功时对仍活跃且未结束的观察比较变更前后结论，仅翻转在同一事务留一条事件；区域写操作（登记/修订/删除/批量）支持 Idempotency-Key 幂等重试。",
     lifespan=lifespan,
 )
 
@@ -172,6 +175,26 @@ def _pass_row_to_out(row: dict) -> dict:
             for p in row["trajectory"]
         ],
         "issued_at": row["created_at"],
+        "cancelled_at": row["cancelled_at"],
+    }
+
+
+def _observation_row_to_out(row: dict) -> dict:
+    """把 observations 表行（trajectory 为 JSONB，t 为 epoch 秒）转成 API 输出。"""
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "safe": row["last_safety"] == "safe",
+        "revision": row["last_revision"],
+        "trajectory": [
+            {
+                "x": p["x"],
+                "y": p["y"],
+                "t": datetime.fromtimestamp(p["t"], tz=timezone.utc),
+            }
+            for p in row["trajectory"]
+        ],
+        "registered_at": row["created_at"],
         "cancelled_at": row["cancelled_at"],
     }
 
@@ -770,6 +793,146 @@ def cancel_pass(pass_id: int = Path(ge=1)):
     return _pass_row_to_out(row)
 
 
+# ---------------------------------------------------------------- 安全状态观察
+
+@app.post("/api/observations", response_model=ObservationOut, status_code=201,
+          responses={
+              422: {"description": "轨迹非法，或首点不晚于登记时刻"},
+          },
+          tags=["observations"])
+def issue_observation(payload: ObservationIssueRequest):
+    """为一条带时区绝对时刻的轨迹登记**可取消的安全状态观察**。
+
+    轨迹要求与 `/api/verify` 相同（至少 2 点、带时区绝对时刻、时刻严格
+    递增、相邻点直线匀速），且**首点时刻必须晚于登记时刻**（以服务端拿到
+    写锁后的当前时间为准）。登记在持有全局元数据行锁的写事务内完成：
+    按当前完整区域集合核验（沿用直线匀速、边界接触即穿越、生效期
+    左闭右开规则），**安全与不安全均可登记**。
+
+    返回观察 `id`、当前安全结论 `safe` 与结论对应的区域集合 `revision`。
+    登记不推进区域 revision，观察也**不阻止**任何区域变更、不改变通行
+    凭证与择时承诺的保护。
+
+    此后单区登记/修订/删除与批量区域变更**成功**时，系统对仍未取消且
+    末点未过的观察在同一事务内比较变更前后的安全结论：**仅结论翻转**
+    才追加一条事件（见 `GET /api/observations/{id}/events`），整批变更
+    对每条观察至多一条；结论不变不产生事件。已取消或末点已过的观察
+    不再产生事件。
+    """
+    # 时刻严格递增等结构校验在几何层统一报错；先快速失败避免无谓的数据库读取
+    traj = geometry.validate_trajectory(payload.points, lambda p: p.t)
+
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            try:
+                row = repository.issue_observation(cur, traj)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+    return _observation_row_to_out(row)
+
+
+@app.get("/api/observations/{observation_id}", response_model=ObservationOut,
+         tags=["observations"])
+def get_observation(observation_id: int = Path(ge=1)):
+    """按编号查询观察：返回轨迹、状态、最近结论及对应 revision；未知编号 404。"""
+    with db.pool.connection() as conn:
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            row = repository.get_observation(cur, observation_id)
+    if row is None:
+        raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
+                                                               "message": f"观察 {observation_id} 不存在"}})
+    return _observation_row_to_out(row)
+
+
+@app.post("/api/observations/{observation_id}/cancel", response_model=ObservationOut,
+          tags=["observations"])
+def cancel_observation(observation_id: int = Path(ge=1)):
+    """取消观察并返回状态；重复取消幂等（结果不变），未知编号 404。
+
+    取消与登记、所有区域写入在同一把全局元数据行锁上串行化；取消不推进
+    区域 revision，取消后观察不再产生任何事件。
+    """
+    with db.pool.connection() as conn:
+        conn.rollback()  # 确保从连接池拿到的连接没有残留事务
+        with conn.cursor() as cur:
+            repository.configure_cursor(cur)
+            try:
+                row = repository.cancel_observation(cur, observation_id)
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                if row is None:
+                    conn.rollback()
+                else:
+                    conn.commit()
+    if row is None:
+        raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
+                                                               "message": f"观察 {observation_id} 不存在"}})
+    return _observation_row_to_out(row)
+
+
+@app.get("/api/observations/{observation_id}/events",
+         response_model=ObservationEventsResponse, tags=["observations"])
+def list_observation_events(
+    observation_id: int = Path(ge=1),
+    cursor: int = Query(
+        default=0, ge=0,
+        description="事件序号游标：只返回 seq 严格大于该游标的事件；首页传 0",
+    ),
+    limit: int = Query(
+        default=50, ge=1, le=200, description="每页事件条数（1~200，默认 50）"
+    ),
+):
+    """按观察编号 + 事件序号游标**升序分页**读取结论翻转事件。
+
+    事件仅在单区/批量区域变更**成功**且该观察的安全结论**翻转**时于
+    同一事务产生（整批至多一条/观察）；返回下页游标 `next_cursor`
+    （末页为 `null`）。未知观察编号返回 404 `not_found`。
+    """
+    with db.pool.connection() as conn:
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            repository.configure_cursor(cur)
+            try:
+                if not repository.observation_exists(cur, observation_id):
+                    page = None
+                else:
+                    page = repository.list_observation_events(
+                        cur, observation_id, cursor, limit
+                    )
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+    if page is None:
+        raise StarletteHTTPException(status_code=404, detail={"error": {"code": "not_found",
+                                                               "message": f"观察 {observation_id} 不存在"}})
+    return {
+        "observation_id": page["observation_id"],
+        "cursor": page["cursor"],
+        "next_cursor": page["next_cursor"],
+        "events": [
+            {
+                "seq": e["seq"],
+                "old_safe": e["old_safety"] == "safe",
+                "new_safe": e["new_safety"] == "safe",
+                "revision": e["revision"],
+                "occurred_at": e["created_at"],
+            }
+            for e in page["events"]
+        ],
+    }
+
+
 # ---------------------------------------------------------------- 择时通行承诺
 
 @app.post("/api/commitments", response_model=CommitmentOut, status_code=201,
@@ -1024,6 +1187,9 @@ def root():
             "POST /api/passes/{id}/cancel",
             "POST /api/commitments", "GET /api/commitments/{id}",
             "POST /api/commitments/{id}/cancel",
+            "POST /api/observations", "GET /api/observations/{id}",
+            "POST /api/observations/{id}/cancel",
+            "GET /api/observations/{id}/events",
             "GET /health",
         ],
     }

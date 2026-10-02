@@ -191,6 +191,8 @@ def create_region(cur, payload, polygon_vertices: list[list[float]]) -> tuple[di
     )
     row = cur.fetchone()
     revision = bump_revision(cur)
+    # 观察不阻止变更：在变更同一事务内比较观察结论，仅翻转者追加事件
+    record_observation_flips(cur, current_regions, candidate, revision, now)
     return _row_to_region(row), revision
 
 
@@ -289,6 +291,8 @@ def update_region(cur, region_id: int, payload, new_polygon) -> tuple[dict, int]
     )
     updated = _row_to_region(cur.fetchone())
     revision = bump_revision(cur)
+    # 观察不阻止变更：在变更同一事务内比较观察结论，仅翻转者追加事件
+    record_observation_flips(cur, current_regions, candidate, revision, now)
     return updated, revision
 
 
@@ -307,16 +311,20 @@ def delete_region(cur, region_id: int) -> tuple[bool, int | None]:
         return False, None
     # 变更后的完整集合（移除该区域）必须仍保证未取消且未结束的凭证安全；
     # 删除只会扩大安全集合，承诺不可能被破坏，但仍沿用同一检查契约
+    all_current = _load_all_regions_locked(cur)
+    before_regions = [_region_row_to_geom(all_current[rid]) for rid in sorted(all_current)]
     current_regions = [
         _region_row_to_geom(r)
-        for rid, r in _load_all_regions_locked(cur).items()
+        for rid, r in all_current.items()
         if rid != region_id
     ]
     now = utcnow()
     check_passes_safe(cur, current_regions, now)
-    check_commitments_safe(cur, current_regions, current_regions, now)
+    check_commitments_safe(cur, before_regions, current_regions, now)
     cur.execute("DELETE FROM regions WHERE id = %s", (region_id,))
     revision = bump_revision(cur)
+    # 观察不阻止变更：删除只可能使不安全观察翻转为安全，仍须在同一事务记录
+    record_observation_flips(cur, before_regions, current_regions, revision, now)
     return True, revision
 
 
@@ -628,6 +636,10 @@ def apply_batch(cur, payload, trajectories: list[list[tuple[float, float, float]
     # 8) 整批全局 revision 只递增一次
     new_revision = bump_revision(cur)
 
+    # 9) 观察不阻止变更，但整批成功时在同一事务内对仍活跃且未结束的观察
+    #    比较变更前后结论：仅翻转者追加至多一条事件
+    record_observation_flips(cur, before_regions, candidate, new_revision, now)
+
     public_ops = [
         {k: v for k, v in op.items() if not k.startswith("_")}
         for op in op_results
@@ -760,6 +772,200 @@ def cancel_pass(cur, pass_id: int) -> dict | None:
         )
         row = cur.fetchone()
     return row
+
+
+# ---------------------------------------------------------------- 安全状态观察
+
+def _safety_of(traj, regions) -> str:
+    """轨迹在给定区域集合下的结论："safe" / "unsafe"。"""
+    results = geometry.verify_trajectory(traj, regions)
+    return "unsafe" if any(r["crossings"] for r in results) else "safe"
+
+
+def _load_constraining_observations(cur, now: datetime) -> list[dict]:
+    """未取消且末点时刻未过的观察（调用方应已持有 region_meta 行锁）。
+
+    观察的登记/取消与所有区域写入都在同一把 meta 行锁上串行化，本查询在
+    锁内读到的是稳定集合；已取消或末点已过的观察不再产生事件。
+    """
+    cur.execute(
+        """
+        SELECT id, trajectory
+        FROM observations
+        WHERE status = 'active' AND end_time > %s
+        ORDER BY id
+        """,
+        (now,),
+    )
+    observations = []
+    for row in cur.fetchall():
+        traj = [
+            (float(p["t"]), float(p["x"]), float(p["y"]))
+            for p in row["trajectory"]
+        ]
+        observations.append({"id": row["id"], "trajectory": traj})
+    return observations
+
+
+def record_observation_flips(
+    cur,
+    regions_before: list[dict],
+    regions_after: list[dict],
+    new_revision: int,
+    now: datetime,
+) -> None:
+    """区域变更成功时，在同一事务内比较观察结论，仅对翻转者追加事件。
+
+    只检查未取消且末点时刻未过的观察；结论未翻转（安全→安全、
+    不安全→不安全）不产生任何记录；翻转时更新观察的最近结论/版本，
+    并以观察内下一个事件序号追加一条 observation_events。
+    一次区域变更（含整批）对每条观察至多一条事件。
+
+    观察不阻止变更：本函数不做任何拒绝判定，只做旁路记录。
+    """
+    for obs in _load_constraining_observations(cur, now):
+        traj = obs["trajectory"]
+        old_safety = _safety_of(traj, regions_before)
+        new_safety = _safety_of(traj, regions_after)
+        if old_safety == new_safety:
+            continue
+        # 单写事务（meta 行锁）内对每张观察串行分配序号，观察内严格递增
+        cur.execute(
+            """
+            INSERT INTO observation_events
+                (observation_id, seq, old_safety, new_safety, revision)
+            SELECT %s, COALESCE(MAX(seq), 0) + 1, %s, %s, %s
+            FROM observation_events WHERE observation_id = %s
+            """,
+            (obs["id"], old_safety, new_safety, new_revision, obs["id"]),
+        )
+        cur.execute(
+            """
+            UPDATE observations
+            SET last_safety = %s, last_revision = %s
+            WHERE id = %s
+            """,
+            (new_safety, new_revision, obs["id"]),
+        )
+
+
+def issue_observation(cur, traj: list[tuple[float, float, float]]) -> dict:
+    """登记安全状态观察：在持有 meta 行锁的事务内核验并持久化。
+
+    traj: [(epoch, x, y), ...]，已校验（≥2 点、时刻严格递增）。
+    首点必须晚于登记时刻（拿到写锁后的当前服务时间），否则 TrajectoryError。
+    安全与不安全均可登记；登记不推进区域 revision。
+    """
+    # 锁全局元数据行：与取消、所有区域写入串行化
+    revision = get_revision(cur)
+    now = utcnow()
+    if traj[0][0] <= now.timestamp():
+        raise geometry.TrajectoryError(
+            "轨迹首点时刻必须晚于登记时刻（当前服务时间），已开始的轨迹不予登记观察"
+        )
+    regions = [
+        _region_row_to_geom(r) for r in _load_all_regions_locked(cur).values()
+    ]
+    safety = _safety_of(traj, regions)
+    cur.execute(
+        """
+        INSERT INTO observations
+            (trajectory, start_time, end_time, status,
+             last_safety, last_revision)
+        VALUES (%(trajectory)s::jsonb, %(start)s, %(end)s, 'active',
+                %(safety)s, %(revision)s)
+        RETURNING id, trajectory, status, last_safety, last_revision,
+                  created_at, cancelled_at
+        """,
+        {
+            "trajectory": json.dumps(
+                [{"x": x, "y": y, "t": t} for t, x, y in traj]
+            ),
+            "start": datetime.fromtimestamp(traj[0][0], tz=timezone.utc),
+            "end": datetime.fromtimestamp(traj[-1][0], tz=timezone.utc),
+            "safety": safety,
+            "revision": revision,
+        },
+    )
+    return cur.fetchone()
+
+
+def get_observation(cur, observation_id: int) -> dict | None:
+    cur.execute(
+        """
+        SELECT id, trajectory, status, last_safety, last_revision,
+               created_at, cancelled_at
+        FROM observations WHERE id = %s
+        """,
+        (observation_id,),
+    )
+    return cur.fetchone()
+
+
+def cancel_observation(cur, observation_id: int) -> dict | None:
+    """取消观察；重复取消幂等（已取消的直接返回现状）。未找到返回 None。
+
+    与登记、所有区域写入在同一把 meta 行锁上串行化；取消不推进区域
+    revision，取消后观察不再产生任何事件。
+    """
+    get_revision(cur)
+    cur.execute(
+        """
+        SELECT id, trajectory, status, last_safety, last_revision,
+               created_at, cancelled_at
+        FROM observations WHERE id = %s
+        FOR UPDATE
+        """,
+        (observation_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    if row["status"] == "active":
+        cur.execute(
+            """
+            UPDATE observations SET status = 'cancelled', cancelled_at = now()
+            WHERE id = %s
+            RETURNING id, trajectory, status, last_safety, last_revision,
+                      created_at, cancelled_at
+            """,
+            (observation_id,),
+        )
+        row = cur.fetchone()
+    return row
+
+
+def observation_exists(cur, observation_id: int) -> bool:
+    cur.execute("SELECT 1 FROM observations WHERE id = %s", (observation_id,))
+    return cur.fetchone() is not None
+
+
+def list_observation_events(
+    cur, observation_id: int, cursor: int, limit: int
+) -> dict:
+    """按事件序号游标升序分页读取观察事件。
+
+    返回序号严格大于 cursor 的至多 limit 条事件，以及下页游标
+    （本页取满时为本页最大 seq，否则 None）。
+    """
+    cur.execute(
+        """
+        SELECT seq, old_safety, new_safety, revision, created_at
+        FROM observation_events
+        WHERE observation_id = %s AND seq > %s
+        ORDER BY seq ASC
+        LIMIT %s
+        """,
+        (observation_id, cursor, limit),
+    )
+    events = cur.fetchall()
+    next_cursor = events[-1]["seq"] if len(events) == limit else None
+    return {
+        "observation_id": observation_id,
+        "cursor": cursor,
+        "events": events,
+        "next_cursor": next_cursor,
+    }
 
 
 # ---------------------------------------------------------------- 择时通行承诺

@@ -258,6 +258,18 @@ class ScheduleRequest(BaseModel):
         return _require_utc(v, info.field_name)
 
 
+class ObservationIssueRequest(BaseModel):
+    """安全状态观察登记请求：一条带时区绝对时刻的连续轨迹（结构同 /api/verify）。
+
+    轨迹至少 2 点、时刻严格递增，且首点时刻必须晚于登记时刻。
+    安全与不安全均可登记。
+    """
+
+    points: list[PointIn] = Field(min_length=2)
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class CommitmentIssueRequest(BaseModel):
     """择时通行承诺签发请求：相对秒数固定行程 + 带时区候选出发窗口。
 
@@ -422,3 +434,43 @@ class PassOut(_UTCDatetimeModel):
 
 class ErrorOut(BaseModel):
     error: dict
+
+
+class ObservationOut(_UTCDatetimeModel):
+    """安全状态观察：登记/查询/取消的统一响应。
+
+    status: active（未取消）/ cancelled（已取消）；
+    safe 为最近一次安全结论（登记时或最近一次使其翻转的区域变更时的结论）；
+    revision 为最近结论对应的区域集合版本号（登记时核验所用 revision）。
+    """
+
+    id: int
+    status: str
+    safe: bool
+    revision: int
+    trajectory: list[PassPointOut]
+    registered_at: datetime
+    cancelled_at: datetime | None
+
+
+class ObservationEventOut(_UTCDatetimeModel):
+    """观察事件：一次区域变更使观察结论翻转（同一事务内产生，至多一条/观察）。"""
+
+    seq: int
+    old_safe: bool
+    new_safe: bool
+    revision: int
+    occurred_at: datetime
+
+
+class ObservationEventsResponse(_UTCDatetimeModel):
+    """按观察编号与事件序号游标升序分页读取的事件页。
+
+    events 为序号严格大于 cursor 的事件（升序、至多 limit 条）；
+    next_cursor 为下页游标（末页时为 null）。
+    """
+
+    observation_id: int
+    cursor: int
+    events: list[ObservationEventOut]
+    next_cursor: int | None
